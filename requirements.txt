@@ -1,0 +1,15 @@
+# Core RAG Framework
+
+langchain
+langchain-community
+langchain-chroma
+langchain-ollama
+# Document Loaders & Utilities
+
+pypdf==4.2.0
+python-dotenv==1.0.1
+pydantic==2.8.2
+# Web Server
+
+fastapi==0.111.1
+uvicorn==0.30.1

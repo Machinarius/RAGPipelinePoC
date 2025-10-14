@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  # --- 1. Ollama Service (Runs LLM and Embeddings Model) ---
+  # We use Ollama to simplify running llama.cpp and GGUF models via a standard API.
+  ollama_llm:
+    image: ollama/ollama:rocm
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    ports:
+      - "11434:11434"
+    volumes:
+      # Stores models persistently across restarts
+      - ./ollama_models:/root/.ollama
+    # Command to pull two small Spanish-friendly models on startup:
+    # 1. An embedding model (all-minilm:33m is a small, fast sentence transformer)
+    # 2. A generation model (Mistral is known for good small-model reasoning)
+    entrypoint: /bin/sh
+    command: -c "
+      ollama serve &
+      sleep 5 &&
+      ollama pull gemma2:2b &&
+      ollama pull embeddinggemma:300m &&
+      wait
+      "
+
+  # --- 2. ChromaDB Vector Store Service ---
+  chroma_db:
+    image: chromadb/chroma:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Stores the vector index persistently
+      - ./chroma_data:/app/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
