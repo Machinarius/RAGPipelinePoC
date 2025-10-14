@@ -1,3 +1,4 @@
+from sys import orig_argv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
@@ -62,7 +63,7 @@ embed_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
 llm = OllamaLLM(
     model=GENERATION_MODEL,
     base_url=OLLAMA_BASE_URL,
-    temperature=0.2,  # Low temperature for factual, deterministic answers
+    temperature=0.1,  # Low temperature for factual, deterministic answers
 )
 
 # Initialize ChromaDB connections (Child collection for searching, Parent for retrieval)
@@ -184,6 +185,9 @@ def rewrite_query_for_synonyms(query: str, llm_instance: OllamaLLM) -> str:
         if rewritten_query.upper().startswith("PREGUNTA REESCRITA:"):
             rewritten_query = rewritten_query[len("PREGUNTA REESCRITA:") :].strip()
 
+        if rewritten_query.upper().startswith("PREGUNTA:"):
+            rewritten_query = rewritten_query[len("PREGUNTA:") :].strip()
+
         print(f"Query Reescrita: {rewritten_query}")
         return rewritten_query
 
@@ -299,6 +303,10 @@ async def ask_rag_agent(query_data: Query):
         else rewrite_query_for_synonyms(original_query, llm)
     )
 
+    if not rewritten_query:
+        rewritten_query = original_query
+
+    # rewritten_query = original_query
     print(f"Query original: {original_query} -> Buscando con: {rewritten_query}")
 
     search_kwargs = {"k": k_value}

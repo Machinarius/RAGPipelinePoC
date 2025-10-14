@@ -4,9 +4,10 @@ langchain
 langchain-community
 langchain-chroma
 langchain-ollama
-# Document Loaders & Utilities
 
-pypdf==4.2.0
+# Document Processing (Docling replaces pypdf)
+docling>=2.0.0
+
 python-dotenv==1.0.1
 pydantic==2.8.2
 # Web Server

@@ -1,13 +1,15 @@
 import argparse
 import os
 import re
+import sys
+import html
 from dotenv import load_dotenv
 
 from chroma_client import get_chroma_client
 
 # Ensure the required libraries are available
 try:
-    from langchain_community.document_loaders import PyPDFLoader
+    from docling.document_converter import DocumentConverter
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain.text_splitter import MarkdownHeaderTextSplitter
     from langchain_chroma import Chroma
@@ -15,7 +17,7 @@ try:
     from langchain_core.documents import Document
 except ImportError:
     print(
-        "Error: Required LangChain packages not installed. Run 'pip install -r requirements.txt'"
+        "Error: Required packages not installed. Run 'pip install -r requirements.txt'"
     )
     exit(1)
 
@@ -45,6 +47,8 @@ def clean_and_prefix_text(text: str) -> str:
     Cleans up common formatting issues and prefixes headers with Markdown syntax
     to enable structured splitting.
     """
+    # 0. Unescape HTML entities that may be present from document conversion
+    text = html.unescape(text)
     # 1. Standardize line breaks and remove common web/PDF footers
     text = text.replace("\n\n", "\n").replace("\r\n", "\n")
 
@@ -61,50 +65,152 @@ def clean_and_prefix_text(text: str) -> str:
     return text.strip()
 
 
+def extract_page_info_from_docling_document(docling_doc) -> list[dict]:
+    """
+    Extract page information and content from Docling document.
+    Returns a list of dictionaries with page content and metadata.
+    """
+    page_docs = []
+
+    # Get the full text as markdown
+    full_markdown = docling_doc.export_to_markdown()
+
+    # Try to extract page information from the DoclingDocument structure
+    # Docling provides page-level information through its document structure
+    try:
+        # Check if the document has page information
+        if hasattr(docling_doc, "pages") and docling_doc.pages:
+            # Process each page separately
+            for page_idx, page in enumerate(docling_doc.pages):
+                page_content = ""
+                page_num = page_idx + 1
+
+                # Extract text from page items
+                for item in page.items:
+                    if hasattr(item, "text") and item.text:
+                        page_content += item.text + "\n"
+
+                if page_content.strip():
+                    # Clean and prefix the page content
+                    cleaned_content = clean_and_prefix_text(page_content)
+
+                    # Add page tag at the beginning
+                    page_tag = f"[PAGINA_ORIGEN: {page_num}]\n\n"
+                    final_content = page_tag + cleaned_content
+
+                    page_docs.append(
+                        {
+                            "page_content": final_content,
+                            "metadata": {
+                                "page": page_num,
+                                "source": "docling_processed",
+                            },
+                        }
+                    )
+        else:
+            # Fallback: use the full markdown as a single document
+            # Try to split by page indicators if they exist in the markdown
+            page_pattern = r"(?=Page\s+\d+|PAGE\s+\d+|\f)"
+            pages = re.split(page_pattern, full_markdown, flags=re.IGNORECASE)
+
+            for page_idx, page_content in enumerate(pages):
+                if page_content.strip():
+                    page_num = page_idx + 1
+                    cleaned_content = clean_and_prefix_text(page_content)
+
+                    # Add page tag at the beginning
+                    page_tag = f"[PAGINA_ORIGEN: {page_num}]\n\n"
+                    final_content = page_tag + cleaned_content
+
+                    page_docs.append(
+                        {
+                            "page_content": final_content,
+                            "metadata": {
+                                "page": page_num,
+                                "source": "docling_processed",
+                            },
+                        }
+                    )
+
+            # If no pages were detected, treat the whole document as one page
+            if not page_docs:
+                cleaned_content = clean_and_prefix_text(full_markdown)
+                page_tag = "[PAGINA_ORIGEN: 1]\n\n"
+                final_content = page_tag + cleaned_content
+
+                page_docs.append(
+                    {
+                        "page_content": final_content,
+                        "metadata": {"page": 1, "source": "docling_processed"},
+                    }
+                )
+
+    except Exception as e:
+        print(f"Warning: Could not extract page information from DoclingDocument: {e}")
+        # Fallback to treating whole document as single page
+        cleaned_content = clean_and_prefix_text(full_markdown)
+        page_tag = "[PAGINA_ORIGEN: 1]\n\n"
+        final_content = page_tag + cleaned_content
+
+        page_docs.append(
+            {
+                "page_content": final_content,
+                "metadata": {"page": 1, "source": "docling_processed"},
+            }
+        )
+
+    return page_docs
+
+
 def ingest_pdf(file_path: str):
     """
-    1. Loads the PDF and extracts initial metadata (page, source).
-    2. Injects page metadata directly into the content for persistence (at the START of the page).
+    1. Loads the PDF using Docling's DocumentConverter for advanced parsing.
+    2. Extracts page-level content and metadata.
     3. Applies hierarchical splitting (Parent-Child) logic and links them.
     4. Cleans metadata and extracts the page number from the content tag.
     5. Stores resulting documents in two ChromaDB collections.
     """
-    print(f"--- Starting Ingestion for: {file_path} ---")
+    print(f"--- Starting Docling-based Ingestion for: {file_path} ---")
 
-    # 1. Initial Document Loading and Cleaning
-    loader = PyPDFLoader(file_path)
-    initial_docs = loader.load()
+    # 1. Document Loading with Docling
+    print("Loading document with Docling...")
+    converter = DocumentConverter()
 
+    try:
+        result = converter.convert(file_path)
+        docling_doc = result.document
+        print(f"Document loaded successfully. Status: {result.status}")
+    except Exception as e:
+        print(f"Error loading document with Docling: {e}")
+        return
+
+    # 2. Extract page-based documents from Docling document
+    print("Extracting page information...")
+    page_based_docs = extract_page_info_from_docling_document(docling_doc)
+    print(f"Extracted {len(page_based_docs)} page(s) from document")
+
+    # Convert to LangChain Document objects
     processed_docs = []
-    for doc in initial_docs:
-        # Step 2: Clean text and inject page number into the content
-        doc.page_content = clean_and_prefix_text(doc.page_content)
-
-        # INJECT PAGE NUMBER DIRECTLY INTO CONTENT FOR PERSISTENCE (AT THE START)
-        page_num = doc.metadata.get("page", 0) + 1
-        page_tag = f"[PAGINA_ORIGEN: {page_num}]\n\n"
-
-        # Prepend the page tag to the content
-        doc.page_content = page_tag + doc.page_content
-
-        # Store original source for file name tracking
-        doc.metadata["original_source"] = doc.metadata.get(
-            "source", os.path.basename(file_path)
+    for page_data in page_based_docs:
+        doc = Document(
+            page_content=page_data["page_content"], metadata=page_data["metadata"]
         )
-
+        # Store original source for file name tracking
+        doc.metadata["original_source"] = os.path.basename(file_path)
         processed_docs.append(doc)
 
     # 3. Hierarchical/Parent Splitting (Separating Articles and Parágrafos)
-
+    print("Applying hierarchical splitting...")
     full_text = "\n\n".join([doc.page_content for doc in processed_docs])
 
     markdown_splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=HEADERS_TO_SPLIT_ON, strip_headers=False
     )
     parent_chunks = markdown_splitter.split_text(full_text)
+    print(f"Created {len(parent_chunks)} parent chunks")
 
     # Dictionary to store parent chunks (Articles) for retrieval by ID
-    parent_chunk_map: Dict[str, Document] = {}
+    parent_chunk_map: dict[str, Document] = {}
 
     # --- Prepare Parent Chunks ---
     for i, doc in enumerate(parent_chunks):
@@ -114,11 +220,12 @@ def ingest_pdf(file_path: str):
         parent_chunk_map[parent_id] = doc
 
     # 4. Child Splitting (Breaking large Parent Chunks into search-ready pieces)
+    print("Creating child chunks...")
     child_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
     )
 
-    child_chunks: List[Document] = []
+    child_chunks: list[Document] = []
     for parent_doc in parent_chunks:
         # Split the parent text into child chunks
         splits = child_splitter.create_documents([parent_doc.page_content])
@@ -130,7 +237,10 @@ def ingest_pdf(file_path: str):
             split.metadata["parent_id"] = parent_doc.metadata["doc_id"]
             child_chunks.append(split)
 
+    print(f"Created {len(child_chunks)} child chunks")
+
     # 5. Final Metadata Cleaning and Standardization
+    print("Cleaning and standardizing metadata...")
     article_regex = re.compile(r"(ARTÍCULO\s+\d+)", re.IGNORECASE)
     paragrafo_regex = re.compile(r"(PARÁGRAFO\s+\d+o?\.)", re.IGNORECASE)
     page_tag_regex = re.compile(r"\[PAGINA_ORIGEN:\s*(\d+)\]", re.IGNORECASE)
@@ -141,7 +251,6 @@ def ingest_pdf(file_path: str):
         metadata = doc.metadata
 
         # --- A. Clean Citation Metadata (ARTÍCULO/PARÁGRAFO) ---
-        # (Same cleaning logic as before)
         if "ARTÍCULO" in metadata:
             match = article_regex.search(metadata["ARTÍCULO"])
             metadata["ARTÍCULO"] = match.group(1).upper() if match else None
@@ -187,15 +296,19 @@ def ingest_pdf(file_path: str):
         final_child_documents.append(doc)
 
     # 6. Store in Vector Database (Two Collections)
+    print("Storing documents in vector database...")
     embed_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
 
     # --- Delete and Create Child Collection (Search Index) ---
     print(f"Deleting existing child collection '{COLLECTION_NAME}'...")
-    Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embed_model,
-        client=chroma_client,
-    ).delete_collection()
+    try:
+        Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=embed_model,
+            client=chroma_client,
+        ).delete_collection()
+    except Exception as e:
+        print(f"Warning: Could not delete child collection: {e}")
 
     print(f"Adding {len(final_child_documents)} child chunks to ChromaDB...")
     Chroma.from_documents(
@@ -206,13 +319,15 @@ def ingest_pdf(file_path: str):
     )
 
     # --- Delete and Create Parent Collection (Context Index) ---
-    # We store the parent chunks here, indexed by their custom ID (doc_id)
     print(f"Deleting existing parent collection '{COLLECTION_NAME_PARENTS}'...")
-    Chroma(
-        collection_name=COLLECTION_NAME_PARENTS,
-        embedding_function=embed_model,
-        client=chroma_client,
-    ).delete_collection()
+    try:
+        Chroma(
+            collection_name=COLLECTION_NAME_PARENTS,
+            embedding_function=embed_model,
+            client=chroma_client,
+        ).delete_collection()
+    except Exception as e:
+        print(f"Warning: Could not delete parent collection: {e}")
 
     parent_documents_list = list(parent_chunk_map.values())
     parent_ids = [doc.metadata["doc_id"] for doc in parent_documents_list]
@@ -226,7 +341,7 @@ def ingest_pdf(file_path: str):
     ).add_documents(documents=parent_documents_list, ids=parent_ids)
 
     print(
-        f"--- Ingestion Complete. {len(final_child_documents)} children and {len(parent_documents_list)} parents indexed. ---"
+        f"--- Docling Ingestion Complete. {len(final_child_documents)} children and {len(parent_documents_list)} parents indexed. ---"
     )
 
 
@@ -253,12 +368,14 @@ def run_server(port: int):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Python RAG Prototype CLI.")
+    parser = argparse.ArgumentParser(
+        description="Python RAG Prototype CLI with Docling."
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Ingest command
     ingest_parser = subparsers.add_parser(
-        "ingest", help="Ingest a PDF file of regulations."
+        "ingest", help="Ingest a PDF file of regulations using Docling."
     )
     ingest_parser.add_argument(
         "pdf_path", type=str, help="Path to the PDF file (e.g., ./regulations.pdf)."
