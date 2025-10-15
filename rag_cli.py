@@ -49,6 +49,10 @@ def clean_and_prefix_text(text: str) -> str:
     """
     # 0. Unescape HTML entities that may be present from document conversion
     text = html.unescape(text)
+
+    # Remove any text within angle brackets (e.g., <Ver Notas de Vigencia>)
+    text = re.sub(r"<.*?>", "", text)
+
     # 1. Standardize line breaks and remove common web/PDF footers
     text = text.replace("\n\n", "\n").replace("\r\n", "\n")
 
@@ -260,10 +264,14 @@ def ingest_pdf(file_path: str):
             metadata["PARÁGRAFO"] = match.group(1).upper() if match else None
 
         # --- B. EXTRACT Page Metadata from Content ---
-        page_match = page_tag_regex.search(doc.page_content)
+        page_matches = page_tag_regex.findall(doc.page_content)
 
-        if page_match:
-            metadata["page"] = int(page_match.group(1))
+        if page_matches:
+            pages = sorted(list(set(int(p) for p in page_matches)))
+            metadata["page"] = pages[0]
+            if len(pages) > 1:
+                metadata["pages"] = ", ".join(map(str, pages))
+
             doc.page_content = page_tag_regex.sub("", doc.page_content).strip()
         else:
             metadata["page"] = None
