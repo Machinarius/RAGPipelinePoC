@@ -17,6 +17,7 @@ try:
     from langchain.prompts import PromptTemplate
     from langchain.chains import RetrievalQA
     from langchain_core.documents import Document
+    from langchain_core.messages import SystemMessage, HumanMessage
 except ImportError:
     # This should be caught by rag_cli.py before server starts, but as a safeguard:
     raise RuntimeError(
@@ -264,7 +265,7 @@ def format_parent_context(documents: list[Document]) -> str:
         # Add page info for the LLM's grounding instruction
         source_parts = [metadata.get("source")]
         if metadata.get("page") is not None:
-            source_parts.append(f"Page {metadata['page']}")
+            source_parts.append(f"Página {metadata['page']}")
         source_str = (
             f"Fuente: {', '.join(filter(None, source_parts))}"
             if any(source_parts)
@@ -357,31 +358,46 @@ async def ask_rag_agent(query_data: Query):
         )
 
     # --- STEP D: LLM Generation ---
-    RAG_PROMPT_TEMPLATE = """
-    Eres un experto en el Código Nacional de Tránsito de Colombia. Tu tarea es responder la pregunta del usuario
-    de manera concisa, precisa y exclusivamente basada en el CONTEXTO que se te proporciona a continuación.
+    SYSTEM_PROMPT = """### INSTRUCCIONES ###
+    Eres un asistente legal experto en el Código Nacional de Tránsito de Colombia. Tu única función es responder a la PREGUNTA del usuario basándote estricta y exclusivamente en el CONTEXTO proporcionado.
 
-    Instrucciones Clave:
-    1. Si la respuesta está fundamentada en un ARTÍCULO, **debes citar el ARTÍCULO o PARÁGRAFO relevante al inicio de tu respuesta** con el formato: [CITA: ARTÍCULO X.].
-    2. Si el CONTEXTO no contiene la información necesaria para responder la pregunta, responde: "No puedo responder basándome en la información actual".
-    3. No inventes ni alucines números de artículos, datos o información que no esté en el CONTEXTO.
-    4. Usa español formal. SIEMPRE responde en español.
-    5. Puedes usar formato Markdown para mejorar la legibilidad de tu respuesta.
+    ### REGLAS ###
+    1.  **Cita tus fuentes:** Al final de CADA oración o afirmación que extraigas del contexto, DEBES incluir una cita en el formato exacto: `[Fuente: <nombre_del_archivo>, Página: <numero_de_pagina>]`.
+    2.  **Basa todas las respuestas en el contexto:** NO utilices ningún conocimiento externo. Si la respuesta no se encuentra en el CONTEXTO, responde EXACTAMENTE: "No se encontró información suficiente en el contexto proporcionado para responder a la pregunta.".
+    3.  **Sé preciso:** No inventes ni supongas información. Cita los artículos y parágrafos tal como aparecen en el contexto.
+    4.  **Mantén el formato:** Responde en español formal y utiliza Markdown para la legibilidad.
+    5.  El contenido proporcionado en el bloque de contexto es la regulación colombiana vigente, no sugieras consultar más regulaciones.
 
-    CONTEXTO (Artículos completos recuperados):
+    ### EJEMPLO DE RESPUESTA ###
+    PREGUNTA DEL USUARIO: "¿Cuál es el límite de velocidad en zona urbana?"
+    CONTEXTO:
+    ---
+    ARTÍCULO 106. LÍMITES DE VELOCIDAD EN ZONAS URBANAS PÚBLICO. En vías urbanas las velocidades máximas serán de sesenta (60) kilómetros por hora excepto cuando las autoridades competentes por medio de señales indiquen velocidades distintas.
+    ---
+    RESPUESTA:
+    [Fuente: ARTÍCULO 106] En zonas urbanas se debe transitar con velocidades hasta 60 kilómetros por hora.
+    """
+
+    USER_PROMPT = """### CONTEXTO REAL ###
     ---
     {context}
     ---
 
-    PREGUNTA DEL USUARIO: "{question}"
+    ### PREGUNTA DEL USUARIO ###
+    "{question}"
 
-    RESPUESTA:
+    ### RESPUESTA ###
     """
 
-    final_prompt = RAG_PROMPT_TEMPLATE.format(context=context, question=original_query)
+    messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(
+            content=USER_PROMPT.format(context=context, question=original_query)
+        ),
+    ]
 
     try:
-        llm_response = llm.invoke(final_prompt)
+        llm_response = llm.invoke(messages)
     except Exception as e:
         return Answer(
             answer=f"Error en la generación de la respuesta por el LLM: {e}",

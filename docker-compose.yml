@@ -20,7 +20,7 @@ services:
     command: -c "
       ollama serve &
       sleep 5 &&
-      ollama pull phi4-mini:3.8b &&
+      ollama pull gemma3:4b &&
       ollama pull mxbai-embed-large:335m &&
       wait
       "
