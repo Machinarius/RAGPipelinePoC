@@ -1,5 +1,7 @@
 from sys import orig_argv
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from starlette.responses import FileResponse
 from pydantic import BaseModel
 import os
 import re
@@ -56,6 +58,9 @@ app = FastAPI(
     title="RAG Prototype API (Python/Ollama)",
     description="Backend for testing RAG pipeline with local models.",
 )
+
+app.mount("/static", StaticFiles(directory="frontend/public"), name="static")
+
 
 # Global variables for RAG components
 chroma_client = get_chroma_client()
@@ -429,3 +434,8 @@ async def ask_rag_agent(query_data: Query):
         )
 
     return Answer(answer=llm_response, source_documents=formatted_sources)
+
+
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str):
+    return FileResponse("frontend/public/index.html")

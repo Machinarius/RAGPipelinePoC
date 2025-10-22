@@ -217,3 +217,5 @@ __marimo__/
 Codigo-nacional-de-transito.pdf
 ollama_models/
 chroma_data/
+node_modules/
+frontend/public/bundle.js

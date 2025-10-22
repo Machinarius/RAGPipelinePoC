@@ -1,0 +1,18 @@
+{
+  "name": "rag-pipeline-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2"
+  },
+  "devDependencies": {
+    "@types/react": "^17.0.39",
+    "@types/react-dom": "^17.0.11",
+    "esbuild": "^0.25.11",
+    "typescript": "^4.5.5"
+  },
+  "scripts": {
+    "build": "esbuild src/index.tsx --bundle --outfile=public/bundle.js --loader:.tsx=tsx"
+  }
+}
