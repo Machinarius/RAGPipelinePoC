@@ -5,6 +5,9 @@ langchain-community
 langchain-chroma
 langchain-ollama
 
+# OpenAI Support (optional, for --openai flag)
+langchain-openai
+
 # Document Processing (Docling replaces pypdf)
 docling>=2.0.0
 

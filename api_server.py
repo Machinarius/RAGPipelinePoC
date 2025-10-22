@@ -1,13 +1,14 @@
-from sys import orig_argv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import FileResponse
 from pydantic import BaseModel
 import os
 import re
+import argparse
 from dotenv import load_dotenv
 from chroma_client import get_chroma_client
-from typing import Any
+from typing import Any, Union, List
+from abc import ABC, abstractmethod
 
 # Ensure the required libraries are available and load environment variables
 try:
@@ -16,15 +17,40 @@ try:
     from langchain_chroma import Chroma
     from langchain_ollama import OllamaEmbeddings
     from langchain_ollama import OllamaLLM
-    from langchain.prompts import PromptTemplate
-    from langchain.chains import RetrievalQA
     from langchain_core.documents import Document
     from langchain_core.messages import SystemMessage, HumanMessage
+
+    # OpenAI imports (will be None if not installed)
+    try:
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+        openai_available = True
+    except ImportError:
+        ChatOpenAI = None
+        OpenAIEmbeddings = None
+        openai_available = False
+
 except ImportError:
     # This should be caught by rag_cli.py before server starts, but as a safeguard:
     raise RuntimeError(
         "Missing required LangChain dependencies. Run 'pip install -r requirements.txt'"
     )
+
+
+# --- Command Line Arguments ---
+def parse_args():
+    parser = argparse.ArgumentParser(description="RAG API Server")
+    parser.add_argument(
+        "--openai", action="store_true", help="Use OpenAI API instead of Ollama"
+    )
+    # Parse known args to allow uvicorn arguments to pass through
+    args, _ = parser.parse_known_args()
+    return args
+
+
+# Parse command line arguments
+cli_args = parse_args()
+use_openai = cli_args.openai
 
 # --- Configuration (loaded from .env via rag_cli.py or environment) ---
 load_dotenv()
@@ -36,27 +62,133 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 COLLECTION_NAME_CHILDREN = os.getenv("COLLECTION_NAME")
 COLLECTION_NAME_PARENTS = os.getenv("COLLECTION_NAME_PARENTS")
 
+# OpenAI specific configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002")
+
 # --- Environment Variable Validation ---
 _VARS = {
     "CHROMA_HOST": CHROMA_HOST,
-    "OLLAMA_BASE_URL": OLLAMA_BASE_URL,
     "COLLECTION_NAME": COLLECTION_NAME,
-    "GENERATION_MODEL": GENERATION_MODEL,
-    "EMBEDDING_MODEL": EMBEDDING_MODEL,
     "COLLECTION_NAME_PARENTS": COLLECTION_NAME_PARENTS,
     "COLLECTION_NAME_CHILDREN": COLLECTION_NAME_CHILDREN,
 }
+
+if use_openai:
+    _VARS.update(
+        {
+            "OPENAI_API_KEY": OPENAI_API_KEY,
+        }
+    )
+    if not openai_available:
+        raise RuntimeError(
+            "OpenAI flag specified but langchain-openai is not installed. "
+            "Install with: pip install langchain-openai"
+        )
+else:
+    _VARS.update(
+        {
+            "OLLAMA_BASE_URL": OLLAMA_BASE_URL,
+            "GENERATION_MODEL": GENERATION_MODEL,
+            "EMBEDDING_MODEL": EMBEDDING_MODEL,
+        }
+    )
+
 _missing_vars = [k for k, v in _VARS.items() if v is None]
 if _missing_vars:
+    provider = "OpenAI" if use_openai else "Ollama"
     raise RuntimeError(
-        f"Missing required environment variables: {', '.join(_missing_vars)}. "
+        f"Missing required environment variables for {provider}: {', '.join(_missing_vars)}. "
         "Please ensure they are set in your environment or .env.local file."
     )
 
 
+# --- LLM Abstraction Classes ---
+class LLMProvider(ABC):
+    """Abstract base class for LLM providers"""
+
+    @abstractmethod
+    def invoke(self, messages: Union[str, List[Any]], **kwargs: Any) -> str:
+        """Invoke the LLM with messages and return response"""
+        pass
+
+    @abstractmethod
+    def get_embedding_model(self) -> Any:
+        """Get the embedding model for this provider"""
+        pass
+
+
+class OllamaProvider(LLMProvider):
+    """Ollama LLM Provider"""
+
+    def __init__(self):
+        if not GENERATION_MODEL or not OLLAMA_BASE_URL or not EMBEDDING_MODEL:
+            raise ValueError("Ollama configuration variables are required")
+        self.llm = OllamaLLM(
+            model=GENERATION_MODEL,
+            base_url=OLLAMA_BASE_URL,
+            temperature=0.15,  # Low temperature for factual, deterministic answers
+        )
+        self.embedding_model = OllamaEmbeddings(
+            model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL
+        )
+
+    def invoke(self, messages: Union[str, List[Any]], **kwargs: Any) -> str:
+        return self.llm.invoke(messages, **kwargs)
+
+    def get_embedding_model(self) -> Any:
+        return self.embedding_model
+
+
+class OpenAIProvider(LLMProvider):
+    """OpenAI LLM Provider"""
+
+    def __init__(self):
+        if not ChatOpenAI or not OpenAIEmbeddings:
+            raise ValueError("OpenAI dependencies not available")
+        if not OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY is required for OpenAI provider")
+        self.llm = ChatOpenAI(
+            model=OPENAI_MODEL,
+            temperature=0.15,  # Low temperature for factual, deterministic answers
+            api_key=OPENAI_API_KEY,
+        )
+        self.embedding_model = OpenAIEmbeddings(
+            model=OPENAI_EMBEDDING_MODEL,
+            api_key=OPENAI_API_KEY,
+        )
+
+    def invoke(self, messages: Union[str, List[Any]], **kwargs: Any) -> str:
+        # Handle both string prompts and message lists
+        if isinstance(messages, str):
+            response = self.llm.invoke([HumanMessage(content=messages)], **kwargs)
+        else:
+            response = self.llm.invoke(messages, **kwargs)
+        # Handle both string and AIMessage response types
+        if hasattr(response, "content"):
+            return str(response.content)
+        return str(response)
+
+    def get_embedding_model(self) -> Any:
+        return self.embedding_model
+
+
+# --- LLM Factory ---
+def create_llm_provider() -> LLMProvider:
+    """Factory function to create the appropriate LLM provider"""
+    if use_openai:
+        print("Initializing OpenAI LLM Provider...")
+        return OpenAIProvider()
+    else:
+        print("Initializing Ollama LLM Provider...")
+        return OllamaProvider()
+
+
+provider_name = "OpenAI" if use_openai else "Ollama"
 app = FastAPI(
-    title="RAG Prototype API (Python/Ollama)",
-    description="Backend for testing RAG pipeline with local models.",
+    title=f"RAG Prototype API (Python/{provider_name})",
+    description=f"Backend for testing RAG pipeline with {provider_name} models.",
 )
 
 app.mount("/static", StaticFiles(directory="frontend/public"), name="static")
@@ -65,14 +197,13 @@ app.mount("/static", StaticFiles(directory="frontend/public"), name="static")
 # Global variables for RAG components
 chroma_client = get_chroma_client()
 
-embed_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
-llm = OllamaLLM(
-    model=GENERATION_MODEL,
-    base_url=OLLAMA_BASE_URL,
-    temperature=0.1,  # Low temperature for factual, deterministic answers
-)
+# Initialize LLM provider
+llm_provider = create_llm_provider()
+embed_model = llm_provider.get_embedding_model()
 
 # Initialize ChromaDB connections (Child collection for searching, Parent for retrieval)
+if not COLLECTION_NAME_CHILDREN or not COLLECTION_NAME_PARENTS:
+    raise ValueError("Collection names are required")
 chroma_children = Chroma(
     collection_name=COLLECTION_NAME_CHILDREN,
     embedding_function=embed_model,
@@ -115,10 +246,12 @@ class Answer(BaseModel):
 @app.on_event("startup")
 def startup_event():
     """Initializes LLM and Vector Store connections when the server starts."""
-    global embed_model, llm, chroma_children, chroma_parents
+    global embed_model, llm_provider, chroma_children, chroma_parents
     print("Initializing RAG components...")
 
     # Initialize Embedding and LLM models
+    provider_name = "OpenAI" if use_openai else "Ollama"
+    print(f"Using {provider_name} as LLM provider")
 
     print("RAG components initialized successfully.")
 
@@ -160,7 +293,7 @@ def extract_article_filter(query: str) -> tuple[str, dict[str, Any] | None]:
 
 
 # --- NUEVA FUNCIÓN DE REESCRITURA DE CONSULTA ---
-def rewrite_query_for_synonyms(query: str, llm_instance: OllamaLLM) -> str:
+def rewrite_query_for_synonyms(query: str, llm_instance: LLMProvider) -> str:
     """Uses the LLM to rewrite the user query using formal terminology."""
 
     # Este prompt le pide a Mistral que actúe como corrector de términos legales.
@@ -180,7 +313,7 @@ def rewrite_query_for_synonyms(query: str, llm_instance: OllamaLLM) -> str:
     try:
         rewritten_query = llm_instance.invoke(
             REWRITE_PROMPT,
-            stop=["\n"],  # Detener la generación después de una línea
+            # stop=["\n"],  # Detener la generación después de una línea
         ).strip()
 
         # Validación: si el LLM devuelve algo muy diferente o vacío, usamos el original.
@@ -304,9 +437,9 @@ async def ask_rag_agent(query_data: Query):
     # 2. Rewrite query to handle synonyms (runs on the cleaned query if a filter was used)
     # If no filter was used, rewrite runs on the original query.
     rewritten_query = (
-        rewrite_query_for_synonyms(cleaned_query, llm)
+        rewrite_query_for_synonyms(cleaned_query, llm_provider)
         if metadata_filter
-        else rewrite_query_for_synonyms(original_query, llm)
+        else rewrite_query_for_synonyms(original_query, llm_provider)
     )
 
     if not rewritten_query:
@@ -314,8 +447,6 @@ async def ask_rag_agent(query_data: Query):
 
     # rewritten_query = original_query
     print(f"Query original: {original_query} -> Buscando con: {rewritten_query}")
-
-    search_kwargs = {"k": k_value}
 
     # --- STEP B: Retrieval Passes ---
 
@@ -402,7 +533,7 @@ async def ask_rag_agent(query_data: Query):
     ]
 
     try:
-        llm_response = llm.invoke(messages)
+        llm_response = llm_provider.invoke(messages)
     except Exception as e:
         return Answer(
             answer=f"Error en la generación de la respuesta por el LLM: {e}",
@@ -438,4 +569,5 @@ async def ask_rag_agent(query_data: Query):
 
 @app.get("/{full_path:path}")
 async def serve_frontend(full_path: str):
+    _ = full_path  # Acknowledge parameter to avoid warning
     return FileResponse("frontend/public/index.html")

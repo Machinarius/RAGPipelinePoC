@@ -15,6 +15,16 @@ try:
     from langchain_chroma import Chroma
     from langchain_ollama import OllamaEmbeddings
     from langchain_core.documents import Document
+
+    # OpenAI imports (will be None if not installed)
+    try:
+        from langchain_openai import OpenAIEmbeddings
+
+        openai_available = True
+    except ImportError:
+        OpenAIEmbeddings = None
+        openai_available = False
+
 except ImportError:
     print(
         "Error: Required packages not installed. Run 'pip install -r requirements.txt'"
@@ -31,6 +41,10 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
 COLLECTION_NAME_PARENTS = os.getenv("COLLECTION_NAME_PARENTS")
 
+# OpenAI specific configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002")
+
 chroma_client = get_chroma_client()
 
 # Define the hierarchical structure for legal documents (Article -> Parágrafos)
@@ -38,6 +52,31 @@ HEADERS_TO_SPLIT_ON = [
     ("##", "ARTÍCULO"),
     ("###", "PARÁGRAFO"),
 ]
+
+
+def create_embedding_model(use_openai: bool = False):
+    """Factory function to create the appropriate embedding model"""
+    if use_openai:
+        if not openai_available:
+            raise RuntimeError(
+                "OpenAI flag specified but langchain-openai is not installed. "
+                "Install with: pip install langchain-openai"
+            )
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI embeddings")
+
+        print("Using OpenAI embeddings...")
+        return OpenAIEmbeddings(
+            model=OPENAI_EMBEDDING_MODEL,
+            api_key=OPENAI_API_KEY,
+        )
+    else:
+        if not EMBEDDING_MODEL or not OLLAMA_BASE_URL:
+            raise RuntimeError("Ollama configuration variables are required")
+
+        print("Using Ollama embeddings...")
+        return OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+
 
 # --- Core RAG Functions ---
 
@@ -166,7 +205,7 @@ def extract_page_info_from_docling_document(docling_doc) -> list[dict]:
     return page_docs
 
 
-def ingest_pdf(file_path: str):
+def ingest_pdf(file_path: str, use_openai: bool = False):
     """
     1. Loads the PDF using Docling's DocumentConverter for advanced parsing.
     2. Extracts page-level content and metadata.
@@ -174,7 +213,10 @@ def ingest_pdf(file_path: str):
     4. Cleans metadata and extracts the page number from the content tag.
     5. Stores resulting documents in two ChromaDB collections.
     """
-    print(f"--- Starting Docling-based Ingestion for: {file_path} ---")
+    provider = "OpenAI" if use_openai else "Ollama"
+    print(
+        f"--- Starting Docling-based Ingestion for: {file_path} (using {provider} embeddings) ---"
+    )
 
     # 1. Document Loading with Docling
     print("Loading document with Docling...")
@@ -305,7 +347,7 @@ def ingest_pdf(file_path: str):
 
     # 6. Store in Vector Database (Two Collections)
     print("Storing documents in vector database...")
-    embed_model = OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_BASE_URL)
+    embed_model = create_embedding_model(use_openai)
 
     # --- Delete and Create Child Collection (Search Index) ---
     print(f"Deleting existing child collection '{COLLECTION_NAME}'...")
@@ -353,19 +395,36 @@ def ingest_pdf(file_path: str):
     )
 
 
-def run_server(port: int):
+def run_server(port: int, use_openai: bool = False):
     """
     Runs the FastAPI RAG server.
     """
-    print(f"--- 2. Starting FastAPI RAG Server on port {port} ---")
+    provider = "OpenAI" if use_openai else "Ollama"
+    print(f"--- 2. Starting FastAPI RAG Server with {provider} on port {port} ---")
     print("Navigate to http://localhost:8500/docs for the interactive API interface.")
     try:
         import uvicorn
 
-        # Set environment variables expected by main.py, ensuring local server host is used
+        # Set environment variables expected by api_server.py, ensuring local server host is used
         os.environ["CHROMA_HOST"] = CHROMA_HOST
         os.environ["OLLAMA_BASE_URL"] = OLLAMA_BASE_URL
-        uvicorn.run("api_server:app", host="127.0.0.1", port=port, reload=True)
+
+        # Build uvicorn command with OpenAI flag if needed
+        import sys
+
+        original_argv = sys.argv[:]
+        try:
+            # Modify sys.argv to include --openai flag for api_server.py argument parsing
+            if use_openai:
+                sys.argv = ["api_server.py", "--openai"]
+            else:
+                sys.argv = ["api_server.py"]
+
+            uvicorn.run("api_server:app", host="127.0.0.1", port=port, reload=True)
+        finally:
+            # Restore original sys.argv
+            sys.argv = original_argv
+
     except ImportError:
         print(
             "Error: Uvicorn not installed. This should not happen if requirements.txt was used."
@@ -388,19 +447,25 @@ def main():
     ingest_parser.add_argument(
         "pdf_path", type=str, help="Path to the PDF file (e.g., ./regulations.pdf)."
     )
+    ingest_parser.add_argument(
+        "--openai", action="store_true", help="Use OpenAI embeddings instead of Ollama"
+    )
 
     # Server command
     server_parser = subparsers.add_parser("server", help="Run the FastAPI chat server.")
     server_parser.add_argument(
         "--port", type=int, default=8500, help="Port to run the FastAPI server on."
     )
+    server_parser.add_argument(
+        "--openai", action="store_true", help="Use OpenAI API instead of Ollama"
+    )
 
     args = parser.parse_args()
 
     if args.command == "ingest":
-        ingest_pdf(args.pdf_path)
+        ingest_pdf(args.pdf_path, args.openai)
     elif args.command == "server":
-        run_server(args.port)
+        run_server(args.port, args.openai)
 
 
 if __name__ == "__main__":
